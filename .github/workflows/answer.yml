@@ -16,7 +16,8 @@ concurrency:
 
 jobs:
   answer:
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest switches to Ubuntu 26 on Oct 19, mid-quiz.
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
