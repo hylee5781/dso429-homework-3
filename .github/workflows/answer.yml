@@ -1,0 +1,50 @@
+name: Answer quiz rounds
+
+on:
+  schedule:
+    # Every 10 minutes, off the top of the hour when GitHub's scheduler is busiest.
+    # Rounds come out on the hour and an answer has 3 hours to land for full credit.
+    - cron: "7,17,27,37,47,57 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: answer-quiz
+  cancel-in-progress: false
+
+jobs:
+  answer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Answer every released round
+        id: solve
+        continue-on-error: true
+        run: python3 solve.py
+
+      - name: Push new or changed answers
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add answers
+          if git diff --cached --quiet; then
+            echo "Nothing new to push."
+            exit 0
+          fi
+          rounds=$(git diff --cached --name-only | sed -E 's|answers/round-0*([0-9]+)\.json|\1|' | paste -sd, - | sed 's/,/, /g')
+          git commit -m "Answer round(s) $rounds"
+          for attempt in 1 2 3 4 5; do
+            git pull --rebase origin main && git push origin HEAD:main && exit 0
+            sleep $((attempt * 15))
+          done
+          exit 1
+
+      - name: Flag anything that needs a look
+        if: steps.solve.outcome != 'success'
+        run: |
+          echo "::error::solve.py reported a problem (an answer it is unsure of, or a download error). See the 'Answer every released round' step."
+          exit 1
