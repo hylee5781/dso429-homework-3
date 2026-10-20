@@ -2,50 +2,92 @@ name: Answer quiz rounds
 
 on:
   schedule:
-    # Every 10 minutes, off the top of the hour when GitHub's scheduler is busiest.
-    # Rounds come out on the hour and an answer has 3 hours to land for full credit.
+    # Backup only. Each run polls for 5.5 hours and then starts the next one itself,
+    # because GitHub fires these cron runs hours apart (18 of ~400 fired Oct 17-19).
+    # Any one that does fire restarts the chain if it has broken.
     - cron: "7,17,27,37,47,57 * * * *"
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: write  # push answers
+  actions: write   # start the next run
+  issues: write    # flag a question solve.py can't answer exactly
 
 concurrency:
+  # One run at a time. A run triggered meanwhile waits, then takes over when this one ends.
   group: answer-quiz
   cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  # Round 168 is released Oct 22 at 20:00 UTC; after this, runs stop starting the next one.
+  STOP_CHAINING_AT: "2026-10-24T00:00:00Z"
 
 jobs:
   answer:
     # Pinned: ubuntu-latest switches to Ubuntu 26 on Oct 19, mid-quiz.
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 350  # jobs are capped at 6 hours
     steps:
       - uses: actions/checkout@v5
 
-      - name: Answer every released round
-        id: solve
-        continue-on-error: true
-        run: python3 solve.py
-
-      - name: Push new or changed answers
+      - name: Answer every released round, every 5 minutes for 5.5 hours
+        env:
+          POLL_SECONDS: 300
+          RUN_MINUTES: 330
         run: |
+          set +e  # a failed download or push must not end the loop; the next pass retries
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add answers
-          if git diff --cached --quiet; then
-            echo "Nothing new to push."
+          deadline=$((SECONDS + RUN_MINUTES * 60))
+          if [[ ! "$(date -u +%Y-%m-%dT%H:%M:%SZ)" < "$STOP_CHAINING_AT" ]]; then deadline=0; fi  # quiz over: one pass
+          log="$RUNNER_TEMP/solve.log"
+          errors=0
+          flagged=""
+          while :; do
+            # Start each pass from the newest main, so a fix pushed to solve.py is used within minutes.
+            git fetch -q origin main && git reset -q --hard FETCH_HEAD
+            python3 solve.py > "$log" 2>&1
+            status=$?
+            cat "$log"
+            warnings=$(grep '^::warning::' "$log" | sed 's/^::warning:://')
+            if [ $status -eq 0 ]; then
+              errors=0
+            elif [ -n "$warnings" ]; then
+              # A question released in the last 3 hours has no exactly matching option. Open an
+              # issue, which GitHub emails to the repo owner, once per new set of warnings.
+              if [ "$warnings" != "$flagged" ]; then
+                printf '%s\n\n```\n%s\n```\n' \
+                  "solve.py answered these with its best guess. A corrected answer still counts for 3 hours after the round's release: add the new question type to solve.py and push it, and the running workflow will use it within 5 minutes." \
+                  "$warnings" | gh issue create --title "Quiz solver needs a look: no exact answer" --body-file -
+                flagged=$warnings
+              fi
+            else
+              errors=$((errors + 1))
+              if [ $errors -eq 6 ]; then
+                tail -n 30 "$log" | gh issue create --title "Quiz solver has failed for 30 minutes" --body-file -
+              fi
+            fi
+            git add answers
+            if ! git diff --cached --quiet; then
+              rounds=$(git diff --cached --name-only | sed -E 's|answers/round-0*([0-9]+)\.json|\1|' | paste -sd, - | sed 's/,/, /g')
+              git commit -q -m "Answer round(s) $rounds"
+              git push -q origin HEAD:main || echo "::warning::Push failed; the next pass retries."
+            fi
+            if [ $SECONDS -ge $deadline ]; then break; fi
+            sleep "$POLL_SECONDS"
+          done
+
+      - name: Start the next run
+        # Skipped when this run is cancelled by hand, so cancelling it stops the chain.
+        if: ${{ !cancelled() }}
+        run: |
+          if [[ ! "$(date -u +%Y-%m-%dT%H:%M:%SZ)" < "$STOP_CHAINING_AT" ]]; then
+            echo "The quiz is over; not starting another run."
             exit 0
           fi
-          rounds=$(git diff --cached --name-only | sed -E 's|answers/round-0*([0-9]+)\.json|\1|' | paste -sd, - | sed 's/,/, /g')
-          git commit -m "Answer round(s) $rounds"
-          for attempt in 1 2 3 4 5; do
-            git pull --rebase origin main && git push origin HEAD:main && exit 0
-            sleep $((attempt * 15))
+          for attempt in 1 2 3; do
+            gh workflow run answer.yml --ref main && exit 0
+            sleep 30
           done
-          exit 1
-
-      - name: Flag anything that needs a look
-        if: steps.solve.outcome != 'success'
-        run: |
-          echo "::error::solve.py reported a problem (an answer it is unsure of, or a download error). See the 'Answer every released round' step."
           exit 1
